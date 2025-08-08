@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from functools import partial
+from collections import Counter
 
 import os
 import logging
@@ -264,7 +265,7 @@ class BM25:
         
         try:
             # Convert numpy arrays to PyTorch tensors and move to GPU
-            data_tensor = torch.tensor(scores["data"], dtype=torch.float32, device=self.device)
+            data_tensor = torch.tensor(scores["data"], dtype=torch.float16, device=self.device)
             indices_tensor = torch.tensor(scores["indices"], dtype=torch.int64, device=self.device)
             indptr_tensor = torch.tensor(scores["indptr"], dtype=torch.int64, device=self.device)
             
@@ -272,15 +273,19 @@ class BM25:
             num_docs = scores["num_docs"]
             vocab_size = len(scores["indptr"]) - 1  # indptr has vocab_size + 1 elements
             
-            # Create PyTorch sparse CSC tensor
-            sparse_tensor = torch.sparse_csc_tensor(
+            # Create PyTorch sparse CSC tensor (for backward compatibility)
+            sparse_csc_tensor = torch.sparse_csc_tensor(
                 indptr_tensor,
                 indices_tensor, 
                 data_tensor,
                 size=(num_docs, vocab_size),
-                dtype=torch.float32,
+                dtype=torch.float16,
                 device=self.device
             )
+            
+            # Convert to COO format first, then to CSR for better SpMV performance
+            sparse_coo = sparse_csc_tensor.to_sparse_coo()
+            sparse_csr_tensor = sparse_coo.to_sparse_csr()
             
             # Return dict with PyTorch tensors for compatibility with existing code
             torch_scores = {
@@ -288,7 +293,8 @@ class BM25:
                 "indices": indices_tensor,
                 "indptr": indptr_tensor,
                 "num_docs": num_docs,
-                "sparse_tensor": sparse_tensor,  # For direct sparse operations
+                "sparse_tensor": sparse_csc_tensor,  # Keep for backward compatibility
+                "sparse_csr_tensor": sparse_csr_tensor,  # Optimized for SpMV
                 "vocab_size": vocab_size
             }
             
@@ -349,7 +355,8 @@ class BM25:
                 doc_scores.scatter_add_(0, doc_indices_for_token, scores_for_token)
         
         return doc_scores
-    def _compute_relevance_from_scores_gpu_optimized_version_two(
+
+    def _compute_relevance_from_scores_gpu_padded(
         self,
         query_tokens_ids_batch: torch.Tensor,
     ) -> torch.Tensor:
@@ -432,7 +439,63 @@ class BM25:
         
         return all_doc_scores
 
-    def _compute_relevance_from_scores_gpu_optimized(
+    def _compute_relevance_from_scores_gpu_sparse_mm(
+        self,
+        sparse_query_tensor: torch.sparse.Tensor,
+    ) -> torch.Tensor:
+        """
+        GPU scoring using optimized sparse matrix multiplication.
+        This should be significantly faster than manual indexing approaches.
+        Now uses pre-computed sparse query tensor to avoid preprocessing overhead.
+        
+        Parameters
+        ----------
+        sparse_query_tensor : torch.sparse.Tensor
+            Sparse CSR tensor of shape (vocab_size, batch_size) representing query frequencies
+            
+        Returns
+        -------
+        torch.Tensor
+            Document scores of shape (num_docs, batch_size)
+        """
+        
+        
+        # Get the sparse CSR tensor for documents
+        sparse_csr_tensor = self.scores.get("sparse_csr_tensor", self.scores["sparse_tensor"])
+        
+        # Log memory before sparse matrix multiplication
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            mem_before = torch.cuda.memory_allocated(self.device) / (1024**3)
+            print(f"      [SparseMM] GPU memory before: {mem_before:.2f}GB")
+        
+        # Perform sparse matrix multiplication
+        # sparse_csr_tensor shape: (num_docs, vocab_size)  
+        # sparse_query_tensor shape: (vocab_size, batch_size)
+        # Result shape: (num_docs, batch_size)
+        start = time.time()
+        doc_scores_transposed = torch.sparse.mm(sparse_csr_tensor, sparse_query_tensor)
+        print(f"      sparse mm taken: {time.time() - start} seconds")
+        
+        # Log memory after sparse matrix multiplication
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            mem_after_mm = torch.cuda.memory_allocated(self.device) / (1024**3)
+            print(f"      [SparseMM] GPU memory after MM: {mem_after_mm:.2f}GB (delta: {mem_after_mm - mem_before:.2f}GB)")
+                
+        start = time.time()
+        # Fix: Ensure we get a proper dense tensor
+        # The result has sparse layout but is_sparse=False, which can cause issues
+        if hasattr(doc_scores_transposed, 'layout') and doc_scores_transposed.layout == torch.sparse_csr:
+            doc_scores_transposed = doc_scores_transposed.to_dense()
+        print(f"      time taken to convert to dense: {time.time() - start} seconds")
+        
+        # Log final memory after conversion
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            mem_final = torch.cuda.memory_allocated(self.device) / (1024**3)
+            print(f"      [SparseMM] GPU memory after dense conversion: {mem_final:.2f}GB (total delta: {mem_final - mem_before:.2f}GB)")
+        
+        return doc_scores_transposed
+
+    def _compute_relevance_from_scores_gpu_index(
         self,
         query_tokens_ids_batch: torch.Tensor,
         batch_sizes: torch.Tensor = None
@@ -877,6 +940,106 @@ class BM25:
 
         return scores
 
+    def _create_sparse_query_tensor_cpu(self, query_tokens_batched: List[List[str]]) -> torch.sparse.Tensor:
+        """
+        Create sparse query tensor on CPU only (for pipeline efficiency).
+        This allows CPU tensor creation to happen concurrently with GPU operations.
+        """
+        assert query_tokens_batched
+            
+        batch_size = len(query_tokens_batched)
+        vocab_size = self.scores["vocab_size"]
+        start = time.time()
+        
+        # Collect all (batch_idx, token_id) pairs and count them efficiently
+        pairs = []
+        for batch_idx, query_tokens in enumerate(query_tokens_batched):
+            if len(query_tokens) == 0:
+                continue
+                
+            if isinstance(query_tokens[0], str):
+                query_ids = self.get_tokens_ids(query_tokens)
+            else:
+                query_ids = query_tokens
+            
+            # Add valid token pairs for this batch
+            for token_id in query_ids:
+                pairs.append((batch_idx, token_id))
+        
+        # Count frequencies using Counter (highly optimized C implementation)
+        frequency_dict = Counter(pairs)
+        print(f"        [CPU Tensor] Time to count frequencies: {time.time() - start}")
+        
+        if not frequency_dict:
+            # No valid tokens found, return empty sparse tensor
+            return torch.sparse_csr_tensor(
+                torch.zeros((1,), dtype=torch.int64),
+                torch.zeros((0,), dtype=torch.int64),
+                torch.zeros((0,), dtype=torch.float16),
+                size=(vocab_size, batch_size),
+                device='cpu'
+            )
+        
+        start = time.time()
+        # Extract indices and values from frequency dictionary
+        batch_indices = []
+        token_indices = []
+        frequencies = []
+        
+        for (batch_idx, token_id), freq in frequency_dict.items():
+            batch_indices.append(batch_idx)
+            token_indices.append(token_id)
+            frequencies.append(freq)
+        
+        print(f"        [CPU Tensor] Time to extract indices: {time.time() - start}")
+        
+        start = time.time()
+
+        # Sort by token_indices (rows) to organize data for CSR format - all on CPU
+        sorted_data = sorted(zip(token_indices, batch_indices, frequencies))
+        
+        if not sorted_data:
+            # Handle empty case - create CPU arrays first
+            crow_indices_cpu = [0] * (vocab_size + 1)
+            col_indices_cpu = []
+            values_cpu = []
+        else:
+            sorted_token_indices, sorted_batch_indices, sorted_frequencies = zip(*sorted_data)
+            
+            # Keep as CPU lists/arrays for now
+            col_indices_cpu = list(sorted_batch_indices)
+            values_cpu = list(sorted_frequencies)
+            
+            # Create row pointers (crow_indices) for CSR format - on CPU
+            crow_indices_cpu = [0] * (vocab_size + 1)
+            
+            # Count entries per row (token) - all CPU operations
+            current_row = 0
+            for i, token_idx in enumerate(sorted_token_indices):
+                while current_row < token_idx:
+                    crow_indices_cpu[current_row + 1] = i
+                    current_row += 1
+                crow_indices_cpu[token_idx + 1] = i + 1
+            
+            # Fill remaining entries
+            while current_row < vocab_size:
+                crow_indices_cpu[current_row + 1] = len(sorted_data)
+                current_row += 1
+                
+        # Create sparse CSR tensor on CPU only
+        print(f"        [CPU Tensor] Creating sparse tensor {vocab_size}x{batch_size} on CPU")
+        sparse_query_T_cpu = torch.sparse_csr_tensor(
+            crow_indices_cpu,
+            col_indices_cpu, 
+            values_cpu,
+            size=(vocab_size, batch_size),
+            device='cpu',
+            dtype=torch.float16
+        )
+        
+        print(f"        [CPU Tensor] Time to create sparse CSR tensor: {time.time() - start}")
+        return sparse_query_T_cpu
+
     def create_query_tensor_padded(self, query_tokens_batched: List[List[str]]) -> torch.Tensor:
         """
         Convert a batch of queries to a zero-padded tensor format.
@@ -945,38 +1108,6 @@ class BM25:
         batch_sizes_tensor = torch.tensor(batch_sizes, device=self.device, dtype=torch.long)
         return query_tokens_tensor, batch_sizes_tensor
     
-    def _get_scores_batched(
-        self,
-        query_tokens_batched: List[List[str]],
-        weight_mask=None,
-    ) -> torch.Tensor:
-        """GPU implementation of batched scoring"""
-        # Convert string tokens to token IDs for all queries
-        start = time.time()
-        query_tokens_tensor = self.create_query_tensor_padded(query_tokens_batched)
-        print(f"time taken create query tensor: {time.time() - start}")        
-        start = time.time()
-        # Validate token IDs
-        max_token_id = query_tokens_tensor.max().item() if len(query_tokens_tensor) > 0 else 0
-        vocab_size = self.scores["vocab_size"]
-        if max_token_id >= vocab_size:
-            raise ValueError(
-                f"The maximum token ID in the query batch ({max_token_id}) is higher than the vocabulary size ({vocab_size})."
-            )
-        
-        # Get batched scores using optimized GPU method
-        scores_batch = self._compute_relevance_from_scores_gpu_optimized_version_two(
-            query_tokens_tensor
-        )
-        
-        # Apply weight mask if provided
-        if weight_mask is not None:
-            weight_mask_tensor = torch.tensor(weight_mask, device=self.device, dtype=torch.float32)
-            scores_batch = scores_batch * weight_mask_tensor.unsqueeze(0)
-        
-        # Convert back to numpy
-        return scores_batch
-    
     def get_scores(
         self, query_tokens_single: List[str], weight_mask=None
     ) -> np.ndarray:
@@ -995,6 +1126,22 @@ class BM25:
 
         return self.get_scores_from_ids(query_tokens_ids, weight_mask=weight_mask)
 
+    def _log_gpu_memory(self, stage: str, batch_idx: int = None):
+        """Log current GPU memory usage with stage information"""
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            try:
+                allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
+                cached = torch.cuda.memory_reserved(self.device)
+                cached_gb = cached / (1024**3)
+                
+                if batch_idx is not None:
+                    print(f"[GPU Memory] {stage} (batch {batch_idx}): {allocated:.2f}GB allocated, {cached_gb:.2f}GB cached")
+                else:
+                    print(f"[GPU Memory] {stage}: {allocated:.2f}GB allocated, {cached_gb:.2f}GB cached")
+            except Exception as e:
+                print(f"[GPU Memory] Failed to get memory stats at {stage}: {e}")
+
+    @torch.inference_mode()
     def _get_top_k_results_batched(
         self,
         query_tokens_batched: List[List[str]],
@@ -1002,12 +1149,13 @@ class BM25:
         backend="auto",
         sorted: bool = False,
         weight_mask: np.ndarray = None,
+        micro_batch_size: int = 2048,
     ):
         """
-        Get top-k results for a batch of queries using GPU acceleration.
+        Get top-k results for a batch of queries using GPU acceleration with micro-batching.
         
-        This method processes multiple queries simultaneously and returns
-        the top-k documents for each query.
+        This method processes queries in micro-batches to manage GPU memory effectively.
+        Each micro-batch is completely independent and GPU memory is freed between batches.
         
         Parameters
         ----------
@@ -1021,6 +1169,8 @@ class BM25:
             Whether to sort the results by score
         weight_mask : np.ndarray, optional
             Weight mask to apply to document scores
+        micro_batch_size : int
+            Number of queries to process in each micro-batch
             
         Returns
         -------
@@ -1029,38 +1179,194 @@ class BM25:
         """
         if not query_tokens_batched:
             return np.array([]), np.array([])
-        start = time.time()
-        lengths = []
-        for i in range(len(query_tokens_batched)):
-            lengths.append(len(query_tokens_batched[i]))
-        
+            
         batch_size = len(query_tokens_batched)
-        num_docs = self.scores["num_docs"]
-        k = min(k, num_docs)  # Ensure k doesn't exceed number of documents
+        self._log_gpu_memory(f"Start batched processing ({batch_size} queries, micro_batch_size={micro_batch_size})")
         
-        # Handle empty queries
-        if all(len(query) == 0 for query in query_tokens_batched):
-            # All queries are empty, return zero scores
-            batch_scores = np.zeros((batch_size, k), dtype=np.float32)
-            batch_indices = np.zeros((batch_size, k), dtype=np.int32)
+        # If batch is small enough, process directly
+        if batch_size <= micro_batch_size:
+            print(f"[Pipeline] Processing single batch of {batch_size} queries")
+            sparse_query_tensor = self._create_sparse_query_tensor_cpu(query_tokens_batched)
+            if self.device.type == "cuda":
+                sparse_query_tensor = sparse_query_tensor.to(self.device)
+            
+            # Get scores
+            scores_tensor = self._compute_relevance_from_scores_gpu_sparse_mm(sparse_query_tensor)
+            del sparse_query_tensor
+            
+            # Compute top-k on GPU
+            topk_scores, topk_indices = self._compute_topk_on_gpu(scores_tensor, k, sorted)
+            
+            # Transfer to CPU
+            batch_scores, batch_indices = self._transfer_topk_to_cpu(topk_scores, topk_indices)
+            
+            self._log_gpu_memory("End single batch processing")
             return batch_scores, batch_indices
-        print(f"time taken construct queries: {time.time() - start}")        
-        start = time.time()
-        # Get scores for all queries using batched GPU method
-        scores_tensor = self._get_scores_batched(query_tokens_batched, weight_mask)
-        print(f"time taken scores: {time.time() - start}")        
+        
+        # Process in micro-batches
+        num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
+        print(f"[Pipeline] Processing {batch_size} queries in {num_micro_batches} micro-batches of size {micro_batch_size}")
+        print(f"[Pipeline] Using CPU/GPU interleaving to hide sparse tensor creation latency")
+        logger.debug(f"Processing {batch_size} queries in micro batches of size {micro_batch_size}")
+        
+        all_batch_scores = []
+        all_batch_indices = []
+        
+        # Pre-create sparse tensor for first micro-batch
+        first_micro_batch = query_tokens_batched[0:min(micro_batch_size, batch_size)]
+        print(f"[Pipeline] Pre-creating sparse tensor for first micro-batch")
+        first_sparse_tensor_cpu = self._create_sparse_query_tensor_cpu(first_micro_batch)
+        
+        # Transfer first tensor to GPU
+        if self.device.type == "cuda":
+            current_sparse_tensor = first_sparse_tensor_cpu.to(self.device)
+            del first_sparse_tensor_cpu
+        else:
+            current_sparse_tensor = first_sparse_tensor_cpu
+            
+        self._log_gpu_memory("After first sparse tensor creation")
+        
+        # Keep track of pending transfers from previous iteration
+        pending_transfer = None
+        
+        for i, start_idx in enumerate(range(0, batch_size, micro_batch_size)):
+            end_idx = min(start_idx + micro_batch_size, batch_size)
+            micro_batch_actual_size = end_idx - start_idx
+            
+            print(f"[Pipeline {i+1}/{num_micro_batches}] Processing queries {start_idx}-{end_idx-1} ({micro_batch_actual_size} queries)")
+            self._log_gpu_memory("Before micro-batch processing", i+1)
+
+            # Start async sparse matrix multiplication on GPU
+            print(f"  [Pipeline] Starting async sparse MM for current batch")
+            start_time = time.time()
+            scores_tensor = self._compute_relevance_from_scores_gpu_sparse_mm(
+                current_sparse_tensor
+            )
+            print(f"  [Pipeline] Sparse MM dispatched (async): {time.time() - start_time:.3f}s")
+            self._log_gpu_memory("After sparse MM dispatch")
+            
+            # While GPU is working on sparse MM, create next sparse tensor on CPU
+            next_sparse_tensor_cpu = None
+            if i + 1 < num_micro_batches:
+                next_start_idx = end_idx
+                next_end_idx = min(next_start_idx + micro_batch_size, batch_size)
+                next_micro_batch = query_tokens_batched[next_start_idx:next_end_idx]
+                
+                print(f"  [Pipeline] Creating next sparse tensor on CPU while GPU processes current batch")
+                cpu_start_time = time.time()
+                next_sparse_tensor_cpu = self._create_sparse_query_tensor_cpu(next_micro_batch)
+                print(f"  [Pipeline] CPU tensor creation: {time.time() - cpu_start_time:.3f}s")
+            
+            # Compute top-k on GPU (this forces sync with sparse MM)
+            print(f"  [Pipeline] Computing top-k (this will sync GPU)")
+            topk_scores, topk_indices = self._compute_topk_on_gpu(scores_tensor, k, sorted)
+            
+            # Clean up current sparse tensor
+            del current_sparse_tensor
+            
+            # Complete any pending CPU transfer from previous iteration while setting up next batch
+            if pending_transfer is not None:
+                prev_topk_scores, prev_topk_indices, prev_batch_idx = pending_transfer
+                print(f"  [Pipeline] Completing previous batch transfer while preparing next batch")
+                prev_scores, prev_indices = self._transfer_topk_to_cpu(prev_topk_scores, prev_topk_indices)
+                all_batch_scores.append(prev_scores)
+                all_batch_indices.append(prev_indices)
+                pending_transfer = None
+            
+            # Transfer next tensor to GPU for next iteration
+            if next_sparse_tensor_cpu is not None:
+                print(f"  [Pipeline] Transferring next tensor to GPU")
+                if self.device.type == "cuda":
+                    current_sparse_tensor = next_sparse_tensor_cpu.to(self.device)
+                    del next_sparse_tensor_cpu
+                else:
+                    current_sparse_tensor = next_sparse_tensor_cpu
+            
+            # For all iterations except the last, queue the transfer for background processing
+            if i < num_micro_batches - 1:
+                print(f"  [Pipeline] Queuing GPU-to-CPU transfer for background processing")
+                pending_transfer = (topk_scores, topk_indices, i)
+            else:
+                # Last iteration - do transfer immediately
+                print(f"  [Pipeline] Final batch - transferring immediately")
+                micro_scores, micro_indices = self._transfer_topk_to_cpu(topk_scores, topk_indices)
+                all_batch_scores.append(micro_scores)
+                all_batch_indices.append(micro_indices)
+            
+            self._log_gpu_memory("After micro-batch processing", i+1)
+            
+            # Free GPU memory between micro-batches
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                self._log_gpu_memory("After GPU cache clear", i+1)
+        
+        # Complete any remaining pending transfer
+        if pending_transfer is not None:
+            prev_topk_scores, prev_topk_indices, prev_batch_idx = pending_transfer
+            print(f"  [Pipeline] Completing final pending transfer")
+            prev_scores, prev_indices = self._transfer_topk_to_cpu(prev_topk_scores, prev_topk_indices)
+            all_batch_scores.append(prev_scores)
+            all_batch_indices.append(prev_indices)
+                
+        print(f"[Micro-batch] Concatenating results from {num_micro_batches} micro-batches")
+        self._log_gpu_memory("Before concatenation")
+        
+        # Concatenate all results
+        final_scores = np.concatenate(all_batch_scores, axis=0)
+        final_indices = np.concatenate(all_batch_indices, axis=0)
+        
+        self._log_gpu_memory("End batched processing")
+        return final_scores, final_indices
+    
+    def _compute_topk_on_gpu(
+        self,
+        scores_tensor: torch.Tensor,
+        k: int,
+        sorted: bool = False,
+    ):
+        """Compute top-k on GPU, returns GPU tensors"""
+        batch_size = scores_tensor.shape[1]
+        print(f"  [TopK] Processing {batch_size} queries for top-k selection")
+        
         start = time.time()
         # Get top-k for all queries simultaneously
         if sorted:
             # Get top-k with sorting (descending order)
-            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=1, sorted=True, largest=True)
+            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=0, sorted=True, largest=True)
         else:
             # Get top-k without sorting (faster)
-            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=1, sorted=False, largest=True)
-        print(f"time taken topk: {time.time() - start}")        
-        # Convert back to numpy
-        batch_scores = topk_scores.cpu().numpy()
-        batch_indices = topk_indices.cpu().numpy()
+            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=0, sorted=False, largest=True)
+        print(f"  [TopK] Time taken for top-k: {time.time() - start:.3f}s")     
+        self._log_gpu_memory("After top-k computation")
+        
+        # Clean up scores tensor immediately
+        del scores_tensor
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return topk_scores, topk_indices
+    
+    def _transfer_topk_to_cpu(
+        self,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ):
+        """Transfer top-k results from GPU to CPU (can be async)"""
+        start = time.time()
+        
+        # Start async transfer to CPU (these operations can overlap with next batch)
+        batch_scores = topk_scores.T.cpu().numpy()
+        batch_indices = topk_indices.T.cpu().numpy()
+        
+        print(f"  [Transfer] Time taken to transfer to CPU: {time.time() - start:.3f}s")
+        self._log_gpu_memory("After CPU transfer")
+        
+        # Clean up GPU tensors
+        del topk_scores, topk_indices
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._log_gpu_memory("After topk tensor cleanup")
         
         return batch_scores, batch_indices
 
@@ -1311,7 +1617,7 @@ class BM25:
             else:
                 return res
         if self.device.type == "cuda":
-            # Use batched GPU processing for better performance
+            # Use batched GPU processing with micro-batching for better memory management
             batch_scores, batch_indices = self._get_top_k_results_batched(
                 query_tokens_batched=query_tokens,
                 k=k,
@@ -1322,21 +1628,12 @@ class BM25:
             
             start = time.time()
             # Post-process results to match expected format
-            corpus = corpus if corpus is not None else self.corpus
+            if return_as == "scores":
+                print(f"time taken post process: {time.time() - start}")        
+                return batch_scores
             
-            if corpus is None:
-                retrieved_docs = batch_indices
-            else:
-                # Handle corpus indexing for batched results
-                if isinstance(corpus, utils.corpus.JsonlCorpus):
-                    retrieved_docs = corpus[batch_indices]
-                elif isinstance(corpus, np.ndarray) and corpus.ndim == 1:
-                    retrieved_docs = corpus[batch_indices]
-                else:
-                    # For regular lists, we need to flatten indices and reshape
-                    flat_indices = batch_indices.flatten()
-                    flat_docs = [corpus[i] for i in flat_indices]
-                    retrieved_docs = np.array(flat_docs).reshape(batch_indices.shape)
+            retrieved_docs = self._retrieve_documents_from_corpus(batch_indices, corpus, return_as)
+            
             print(f"time taken post process: {time.time() - start}")        
             if return_as == "tuple":
                 return Results(documents=retrieved_docs, scores=batch_scores)
@@ -1375,21 +1672,11 @@ class BM25:
         scores, indices = zip(*out)
         scores, indices = np.array(scores), np.array(indices)
         print(f"time taken topk_fn: {time.time() - start}")        
-
-        corpus = corpus if corpus is not None else self.corpus
-
-        if corpus is None:
-            retrieved_docs = indices
-        else:
-            # if it is a JsonlCorpus object, we do not need to convert it to a list
-            if isinstance(corpus, utils.corpus.JsonlCorpus):
-                retrieved_docs = corpus[indices]
-            elif isinstance(corpus, np.ndarray) and corpus.ndim == 1:
-                retrieved_docs = corpus[indices]
-            else:
-                index_flat = indices.flatten().tolist()
-                results = [corpus[i] for i in index_flat]
-                retrieved_docs = np.array(results).reshape(indices.shape)
+        start = time.time()
+        if return_as == "scores":
+            return scores
+        print(f"time taken post process: {time.time() - start}")        
+        retrieved_docs = self._retrieve_documents_from_corpus(indices, corpus, return_as)
 
         if return_as == "tuple":
             return Results(documents=retrieved_docs, scores=scores)
@@ -1457,9 +1744,22 @@ class BM25:
         indices_path = save_dir / indices_name
         indptr_path = save_dir / indptr_name
 
-        np.save(data_path, self.scores["data"], allow_pickle=allow_pickle)
-        np.save(indices_path, self.scores["indices"], allow_pickle=allow_pickle)
-        np.save(indptr_path, self.scores["indptr"], allow_pickle=allow_pickle)
+        # Handle GPU tensors by converting to CPU numpy arrays first
+        if self.device.type == "cuda" and "sparse_tensor" in self.scores:
+            # GPU tensors - convert to CPU first
+            print("Converting GPU tensors to CPU for saving...")
+            data_cpu = self.scores["data"].cpu().numpy()
+            indices_cpu = self.scores["indices"].cpu().numpy()
+            indptr_cpu = self.scores["indptr"].cpu().numpy()
+            
+            np.save(data_path, data_cpu, allow_pickle=allow_pickle)
+            np.save(indices_path, indices_cpu, allow_pickle=allow_pickle)
+            np.save(indptr_path, indptr_cpu, allow_pickle=allow_pickle)
+        else:
+            # CPU arrays - save directly
+            np.save(data_path, self.scores["data"], allow_pickle=allow_pickle)
+            np.save(indices_path, self.scores["indices"], allow_pickle=allow_pickle)
+            np.save(indptr_path, self.scores["indptr"], allow_pickle=allow_pickle)
 
         # save nonoccurrence array if it exists
         if self.nonoccurrence_array is not None:
@@ -1722,6 +2022,74 @@ class BM25:
             bm25_obj.nonoccurrence_array = None
 
         return bm25_obj
+
+    def _retrieve_documents_from_corpus(self, indices, corpus=None, return_as="tuple"):
+        """
+        Helper function to retrieve documents from corpus given indices.
+        
+        Parameters
+        ----------
+        indices : np.ndarray
+            Document indices to retrieve
+        corpus : list, np.ndarray, JsonlCorpus, optional
+            Corpus to retrieve from. If None, uses self.corpus
+        return_as : str
+            Format to return results in
+            
+        Returns
+        -------
+        np.ndarray or tuple
+            Retrieved documents in requested format
+        """
+        corpus = corpus if corpus is not None else self.corpus
+        
+        # Fast path: if no corpus needed, return indices directly
+        if corpus is None or return_as == "indices":
+            return indices
+        elif return_as == "scores":
+            raise ValueError("Cannot return scores without providing scores")
+        
+        # Handle corpus indexing
+        if isinstance(corpus, utils.corpus.JsonlCorpus):
+            retrieved_docs = corpus[indices]
+        elif isinstance(corpus, np.ndarray):
+            # NumPy arrays support direct fancy indexing
+            retrieved_docs = corpus[indices]
+        else:
+            # Optimized corpus lookup for regular lists
+            if indices.ndim == 1 or (indices.ndim == 2 and indices.shape[0] == 1):
+                # Single query case - use the original simple logic
+                index_flat = indices.flatten().tolist()
+                results = [corpus[i] for i in index_flat]
+                retrieved_docs = np.array(results).reshape(indices.shape)
+            else:
+                # Batch case - use optimized logic
+                batch_size, k = indices.shape
+                total_lookups = batch_size * k
+                corpus_size = len(corpus)
+                
+                if corpus_size < 50000 and total_lookups > 100:
+                    # Convert to numpy array for repeated access (amortize conversion cost)
+                    if not hasattr(self, '_corpus_array_cache') or self._corpus_array_cache is None:
+                        self._corpus_array_cache = np.array(corpus, dtype=object)
+                    retrieved_docs = self._corpus_array_cache[indices]
+                else:
+                    # Use optimized batch processing to minimize Python overhead
+                    retrieved_docs = np.empty(indices.shape, dtype=object)
+                    
+                    # Process in chunks to improve cache locality
+                    chunk_size = min(1000, k)  # Process k documents at a time per query
+                    for batch_idx in range(batch_size):
+                        indices_for_batch = indices[batch_idx]
+                        docs_for_batch = []
+                        for i in range(0, k, chunk_size):
+                            chunk_indices = indices_for_batch[i:i+chunk_size]
+                            chunk_docs = [corpus[idx] for idx in chunk_indices]
+                            docs_for_batch.extend(chunk_docs)
+                        retrieved_docs[batch_idx] = docs_for_batch[:k]
+        
+        return retrieved_docs
+
 
     def free_gpu_memory(self):
         """
