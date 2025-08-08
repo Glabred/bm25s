@@ -9,6 +9,8 @@ import json
 from typing import Any, Tuple, Dict, Iterable, List, NamedTuple, Union
 
 import numpy as np
+import torch
+import time
 
 from .utils import json_functions as json_functions
 
@@ -141,6 +143,7 @@ class BM25:
         int_dtype="int32",
         corpus=None,
         backend="numpy",
+        device="cpu",
     ):
         """
         BM25S initialization.
@@ -157,7 +160,8 @@ class BM25:
             The delta parameter in the BM25L and BM25+ formulas; it is ignored for other methods.
 
         method : str
-            The method to use for scoring term frequency. Choose from 'robertson', 'lucene', 'atire'.
+            The method to use for scoring term frequency. Choose from 'robertson', 'lucene', 'atire', 'bm25l', 'bm25+'.
+            Note: GPU acceleration (device='cuda') only supports 'robertson', 'lucene', and 'atire'.
 
         idf_method : str
             The method to use for scoring inverse document frequency (same choices as `method`).
@@ -180,6 +184,11 @@ class BM25:
             to use the numba backend, which requires the numba library. If you select `backend="auto"`,
             the function will use the numba backend if it is available, otherwise it will use the numpy
             backend.
+            
+        device : str
+            The device to use for computation. Can be "cpu" or "cuda". If "cuda" is specified,
+            the sparse matrix will be converted to PyTorch CSC tensors and moved to GPU memory
+            for accelerated operations. If CUDA is not available, it will fall back to CPU.
         """
         self.k1 = k1
         self.b = b
@@ -191,11 +200,18 @@ class BM25:
         self.methods_requiring_nonoccurrence = ("bm25l", "bm25+")
         self.corpus = corpus
         self._original_version = __version__
+        
+        # Handle device initialization with CUDA availability check
+        if device == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available. Falling back to CPU.")
+            device = "cpu"
+        self.device = torch.device(device)
 
         if backend == "auto":
             self.backend = "numba" if selection_jit is not None else "numpy"
         else:
             self.backend = backend
+        print("self.backend: ", self.backend)
 
     @staticmethod
     def _infer_corpus_object(corpus):
@@ -222,6 +238,305 @@ class BM25:
             raise ValueError(
                 "Corpus must be a list of list of tokens, an object with the `ids` and `vocab` attributes, or a tuple of two lists: the first list is the list of unique token IDs, and the second list is the list of token IDs for each document."
             )
+
+    def _convert_scores_to_torch_csc(self, scores):
+        """
+        Convert scipy sparse matrix components to PyTorch CSC tensor on GPU.
+        
+        Parameters
+        ----------
+        scores : dict
+            Dictionary containing 'data', 'indices', 'indptr', and 'num_docs'
+            from scipy.sparse.csc_matrix
+            
+        Returns
+        -------
+        dict
+            Dictionary with PyTorch tensors for GPU computation
+        """
+        if not torch.cuda.is_available() and self.device.type == "cuda":
+            raise RuntimeError("CUDA is not available but GPU device was specified")
+        
+        # Validate input scores dictionary
+        required_keys = ["data", "indices", "indptr", "num_docs"]
+        if not all(key in scores for key in required_keys):
+            raise ValueError(f"scores dict must contain keys: {required_keys}")
+        
+        try:
+            # Convert numpy arrays to PyTorch tensors and move to GPU
+            data_tensor = torch.tensor(scores["data"], dtype=torch.float32, device=self.device)
+            indices_tensor = torch.tensor(scores["indices"], dtype=torch.int64, device=self.device)
+            indptr_tensor = torch.tensor(scores["indptr"], dtype=torch.int64, device=self.device)
+            
+            # Get matrix dimensions from original scores
+            num_docs = scores["num_docs"]
+            vocab_size = len(scores["indptr"]) - 1  # indptr has vocab_size + 1 elements
+            
+            # Create PyTorch sparse CSC tensor
+            sparse_tensor = torch.sparse_csc_tensor(
+                indptr_tensor,
+                indices_tensor, 
+                data_tensor,
+                size=(num_docs, vocab_size),
+                dtype=torch.float32,
+                device=self.device
+            )
+            
+            # Return dict with PyTorch tensors for compatibility with existing code
+            torch_scores = {
+                "data": data_tensor,
+                "indices": indices_tensor,
+                "indptr": indptr_tensor,
+                "num_docs": num_docs,
+                "sparse_tensor": sparse_tensor,  # For direct sparse operations
+                "vocab_size": vocab_size
+            }
+            
+            logger.debug(f"Successfully converted sparse matrix to PyTorch CSC tensor on {self.device}")
+            logger.debug(f"Matrix shape: {num_docs} x {vocab_size}, nnz: {len(data_tensor)}")
+            
+            return torch_scores
+            
+        except Exception as e:
+            logger.error(f"Failed to convert scores to PyTorch tensor: {e}")
+            raise RuntimeError(f"Error converting scores to GPU tensors: {e}") from e
+
+    def _compute_relevance_from_scores_gpu_mult(
+        self,
+        query_tokens_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        GPU-accelerated scoring using sparse matrix multiplication.
+        
+        This method creates a query vector and multiplies it with the sparse matrix
+        to compute document scores. This approach can be more efficient for certain
+        query patterns compared to index selection.
+        
+        Parameters
+        ----------
+        query_tokens_ids : torch.Tensor
+            Tensor of token IDs to score on GPU
+            
+        Returns
+        -------
+        torch.Tensor
+            Array of BM25 relevance scores for the query on GPU
+        """
+        # Ensure query tokens are on the same device and correct dtype
+        query_tokens_ids = query_tokens_ids.to(self.device, dtype=torch.long)
+        
+        # Get the CSC sparse tensor components directly (like CPU version)
+        data = self.scores["data"]        # Non-zero values
+        indices = self.scores["indices"]  # Row indices for each value
+        indptr = self.scores["indptr"]    # Column pointers
+        num_docs = self.scores["num_docs"]
+        
+        # Use CPU-like approach: extract start/end positions for all query tokens at once
+        indptr_starts = indptr[query_tokens_ids]
+        indptr_ends = indptr[query_tokens_ids + 1]
+        
+        # Initialize document scores
+        doc_scores = torch.zeros(num_docs, device=self.device, dtype=torch.float32)
+        
+        # Process each query token (mimicking CPU np.add.at behavior)
+        for i in range(len(query_tokens_ids)):
+            start, end = indptr_starts[i].item(), indptr_ends[i].item()
+            if start < end:  # Token has non-zero scores
+                doc_indices_for_token = indices[start:end]
+                scores_for_token = data[start:end]
+                
+                # Use scatter_add for accumulation (equivalent to np.add.at)
+                doc_scores.scatter_add_(0, doc_indices_for_token, scores_for_token)
+        
+        return doc_scores
+    def _compute_relevance_from_scores_gpu_optimized_version_two(
+        self,
+        query_tokens_ids_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Optimized GPU scoring for batched queries using zero-padded tensors.
+        
+        Parameters
+        ----------
+        query_tokens_ids_batch : torch.Tensor
+            Zero-padded tensor of shape (batch_size, max_query_length) where 
+            shorter queries are padded with zeros.
+            
+        Returns
+        -------
+        torch.Tensor
+            Document scores of shape (batch_size, num_docs)
+        """
+        query_tokens_ids_batch = query_tokens_ids_batch.to(self.device, dtype=torch.long)
+        batch_size, max_query_length = query_tokens_ids_batch.shape
+        num_docs = self.scores["num_docs"]
+        
+        # Initialize output tensor
+        all_doc_scores = torch.zeros((batch_size, num_docs), device=self.device, dtype=torch.float32)
+        
+        if max_query_length == 0:
+            return all_doc_scores
+            
+        # Create mask for non-zero tokens (padding tokens are 0)
+        # Assuming 0 is used as padding and is not a valid token ID
+        valid_mask = query_tokens_ids_batch > 0
+        
+        if not valid_mask.any():
+            return all_doc_scores
+            
+        # Get all valid token positions
+        batch_indices, token_positions = torch.where(valid_mask)
+        valid_tokens = query_tokens_ids_batch[batch_indices, token_positions]
+        
+        # Get sparse matrix components for valid tokens
+        indptr_starts = self.scores["indptr"][valid_tokens]
+        indptr_ends = self.scores["indptr"][valid_tokens + 1]
+        lengths = indptr_ends - indptr_starts
+        
+        # Filter out tokens that don't appear in any documents
+        token_mask = lengths > 0
+        if not token_mask.any():
+            return all_doc_scores
+            
+        # Filter to only tokens that have document matches
+        filtered_batch_indices = batch_indices[token_mask]
+        filtered_starts = indptr_starts[token_mask]
+        filtered_lengths = lengths[token_mask]
+        
+        # Generate indices for all document-score pairs
+        max_length = filtered_lengths.max().item()
+        position_indices = torch.arange(max_length, device=self.device).unsqueeze(0)
+        valid_positions = position_indices < filtered_lengths.unsqueeze(1)
+        
+        # Calculate flat indices into the sparse matrix data
+        flat_indices = filtered_starts.unsqueeze(1) + position_indices
+        flat_indices = flat_indices[valid_positions]
+        
+        if len(flat_indices) == 0:
+            return all_doc_scores
+            
+        # Get document indices and scores from sparse matrix
+        doc_indices = self.scores["indices"][flat_indices]
+        scores = self.scores["data"][flat_indices]
+        
+        # Expand batch indices to match the flattened structure
+        batch_indices_expanded = filtered_batch_indices.unsqueeze(1).expand(-1, max_length)[valid_positions]
+        
+        # Combine batch and document indices for scatter operation
+        combined_indices = batch_indices_expanded * num_docs + doc_indices
+        
+        # Accumulate scores using scatter_add
+        flat_scores = all_doc_scores.view(-1)
+        flat_scores.scatter_add_(0, combined_indices, scores)
+        all_doc_scores = flat_scores.view(batch_size, num_docs)
+        
+        return all_doc_scores
+
+    def _compute_relevance_from_scores_gpu_optimized(
+        self,
+        query_tokens_ids_batch: torch.Tensor,
+        batch_sizes: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Highly optimized GPU scoring using vectorized operations.
+        
+        This method processes multiple queries simultaneously on GPU.
+        
+        Parameters
+        ----------
+        query_tokens_ids_batch : torch.Tensor
+            Flattened tensor of token IDs for all queries (1D tensor)
+        batch_sizes : torch.Tensor, optional
+            Tensor containing the number of tokens in each query. If None, treats as single query.
+            
+        Returns
+        -------
+        torch.Tensor
+            2D tensor of BM25 scores: (batch_size, num_docs) if batched, (num_docs,) if single query
+        """
+        # Ensure tokens are on the correct device and dtype
+        query_tokens_ids_batch = query_tokens_ids_batch.to(self.device, dtype=torch.long)
+        
+        # Handle single query case (backward compatibility)
+        if batch_sizes is None:
+            batch_sizes = torch.tensor([len(query_tokens_ids_batch)], device=self.device)
+            single_query = True
+        else:
+            batch_sizes = batch_sizes.to(self.device, dtype=torch.long)
+            single_query = False
+        
+        batch_size = len(batch_sizes)
+        num_docs = self.scores["num_docs"]
+        
+        # Get the CSC sparse tensor components
+        data = self.scores["data"]
+        indices = self.scores["indices"] 
+        indptr = self.scores["indptr"]
+        
+        # Initialize result tensor for all queries
+        all_doc_scores = torch.zeros((batch_size, num_docs), device=self.device, dtype=torch.float32)
+        
+        # Process all queries at once using advanced indexing
+        if len(query_tokens_ids_batch) == 0:
+            return all_doc_scores.squeeze(0) if single_query else all_doc_scores
+        
+        # Get start/end positions for all query tokens at once
+        indptr_starts = indptr[query_tokens_ids_batch]
+        indptr_ends = indptr[query_tokens_ids_batch + 1]
+        
+        # Calculate lengths for each query token
+        lengths = indptr_ends - indptr_starts
+        
+        # Create mask for tokens that have non-zero scores
+        valid_tokens = lengths > 0
+        
+        if not valid_tokens.any():
+            return all_doc_scores.squeeze(0) if single_query else all_doc_scores
+        
+        # Filter to only process tokens with non-zero scores
+        valid_indices = torch.where(valid_tokens)[0]
+        valid_starts = indptr_starts[valid_tokens]
+        valid_lengths = lengths[valid_tokens]
+        
+        # Create query assignment for each valid token
+        query_starts = torch.cumsum(torch.cat([torch.tensor([0], device=self.device), batch_sizes[:-1]]), dim=0)
+        query_assignment = torch.searchsorted(query_starts, valid_indices, right=True) - 1
+        
+        # Create batch indices for all relevant entries
+        max_length = valid_lengths.max().item() if len(valid_lengths) > 0 else 0
+        
+        if max_length == 0:
+            return all_doc_scores.squeeze(0) if single_query else all_doc_scores
+        
+        # Create index offsets for batch processing
+        position_indices = torch.arange(max_length, device=self.device).unsqueeze(0)
+        valid_positions = position_indices < valid_lengths.unsqueeze(1)
+        
+        # Calculate flat indices into data/indices arrays
+        flat_indices = valid_starts.unsqueeze(1) + position_indices
+        flat_indices = flat_indices[valid_positions]
+        
+        if len(flat_indices) == 0:
+            return all_doc_scores.squeeze(0) if single_query else all_doc_scores
+        
+        # Extract document indices and scores
+        batch_doc_indices = indices[flat_indices]
+        batch_scores = data[flat_indices]
+        
+        # Get query assignments for each score (expand valid_positions mask)
+        query_indices_expanded = query_assignment.unsqueeze(1).expand(-1, max_length)[valid_positions]
+        
+        # Create combined indices for 2D scatter: (query_idx * num_docs + doc_idx)
+        combined_indices = query_indices_expanded * num_docs + batch_doc_indices
+        
+        # Flatten the result tensor and use scatter_add
+        flat_scores = all_doc_scores.view(-1)
+        flat_scores.scatter_add_(0, combined_indices, batch_scores)
+        
+        # Reshape back to (batch_size, num_docs)
+        all_doc_scores = flat_scores.view(batch_size, num_docs)
+        
+        return all_doc_scores.squeeze(0) if single_query else all_doc_scores
 
     @staticmethod
     def _compute_relevance_from_scores(
@@ -500,7 +815,13 @@ class BM25:
             if inferred_corpus_obj != "token_ids" and "" not in vocab_dict:
                 vocab_dict[""] = max(vocab_dict.values()) + 1
 
-        self.scores = scores
+        if self.device.type == "cuda":
+            # Convert scipy sparse matrix data to PyTorch CSC tensor and pin to GPU memory
+            self.scores = self._convert_scores_to_torch_csc(scores)
+            logger.debug(f"GPU acceleration enabled for BM25 method: {self.method}")
+        else:
+            self.scores = scores
+
         self.vocab_dict = vocab_dict
 
         # we create unique token IDs from the vocab_dict for faster lookup
@@ -556,6 +877,106 @@ class BM25:
 
         return scores
 
+    def create_query_tensor_padded(self, query_tokens_batched: List[List[str]]) -> torch.Tensor:
+        """
+        Convert a batch of queries to a zero-padded tensor format.
+        
+        Parameters
+        ----------
+        query_tokens_batched : List[List[str]]
+            List of queries, where each query is a list of tokens
+            
+        Returns
+        -------
+        torch.Tensor
+            Zero-padded tensor of shape (batch_size, max_query_length)
+        """
+        if not query_tokens_batched:
+            return torch.zeros((0, 0), device=self.device, dtype=torch.long)
+            
+        # Convert string tokens to token IDs and find max length in single pass
+        query_ids_batched = []
+        max_length = 0
+        
+        for query_tokens in query_tokens_batched:
+            if len(query_tokens) == 0:
+                query_ids = []
+            elif isinstance(query_tokens[0], str):
+                query_ids = self.get_tokens_ids(query_tokens)
+            else:
+                query_ids = query_tokens
+            query_ids_batched.append(query_ids)
+            max_length = max(max_length, len(query_ids))
+        
+        batch_size = len(query_ids_batched)
+        
+        if max_length == 0:
+            return torch.zeros((batch_size, 0), device=self.device, dtype=torch.long)
+        
+        # Create padded list directly (avoiding numpy array initialization)
+        padded_data = []
+        for query_ids in query_ids_batched:
+            padded_query = query_ids + [0] * (max_length - len(query_ids))
+            padded_data.extend(padded_query)
+                
+        # Single tensor creation and reshape
+        return torch.tensor(padded_data, device=self.device, dtype=torch.long).view(batch_size, max_length)
+
+    def create_query_tensor(self, query_tokens_batched: List[List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        query_ids_batched = []
+        batch_sizes = []
+        
+        for query_tokens in query_tokens_batched:
+            if len(query_tokens) == 0:
+                query_ids = []
+            elif isinstance(query_tokens[0], str):
+                query_ids = self.get_tokens_ids(query_tokens)
+            else:
+                query_ids = query_tokens  # Already token IDs
+            query_ids_batched.extend(query_ids)
+            batch_sizes.append(len(query_ids))
+        
+        if not query_ids_batched:
+            # All queries are empty
+            return np.zeros((len(query_tokens_batched), self.scores["num_docs"]), dtype=np.float32)
+        
+        # Convert to tensors
+        query_tokens_tensor = torch.tensor(query_ids_batched, device=self.device, dtype=torch.long)
+        batch_sizes_tensor = torch.tensor(batch_sizes, device=self.device, dtype=torch.long)
+        return query_tokens_tensor, batch_sizes_tensor
+    
+    def _get_scores_batched(
+        self,
+        query_tokens_batched: List[List[str]],
+        weight_mask=None,
+    ) -> torch.Tensor:
+        """GPU implementation of batched scoring"""
+        # Convert string tokens to token IDs for all queries
+        start = time.time()
+        query_tokens_tensor = self.create_query_tensor_padded(query_tokens_batched)
+        print(f"time taken create query tensor: {time.time() - start}")        
+        start = time.time()
+        # Validate token IDs
+        max_token_id = query_tokens_tensor.max().item() if len(query_tokens_tensor) > 0 else 0
+        vocab_size = self.scores["vocab_size"]
+        if max_token_id >= vocab_size:
+            raise ValueError(
+                f"The maximum token ID in the query batch ({max_token_id}) is higher than the vocabulary size ({vocab_size})."
+            )
+        
+        # Get batched scores using optimized GPU method
+        scores_batch = self._compute_relevance_from_scores_gpu_optimized_version_two(
+            query_tokens_tensor
+        )
+        
+        # Apply weight mask if provided
+        if weight_mask is not None:
+            weight_mask_tensor = torch.tensor(weight_mask, device=self.device, dtype=torch.float32)
+            scores_batch = scores_batch * weight_mask_tensor.unsqueeze(0)
+        
+        # Convert back to numpy
+        return scores_batch
+    
     def get_scores(
         self, query_tokens_single: List[str], weight_mask=None
     ) -> np.ndarray:
@@ -573,6 +994,75 @@ class BM25:
             )
 
         return self.get_scores_from_ids(query_tokens_ids, weight_mask=weight_mask)
+
+    def _get_top_k_results_batched(
+        self,
+        query_tokens_batched: List[List[str]],
+        k: int = 1000,
+        backend="auto",
+        sorted: bool = False,
+        weight_mask: np.ndarray = None,
+    ):
+        """
+        Get top-k results for a batch of queries using GPU acceleration.
+        
+        This method processes multiple queries simultaneously and returns
+        the top-k documents for each query.
+        
+        Parameters
+        ----------
+        query_tokens_batched : List[List[str]]
+            List of queries, where each query is a list of tokens
+        k : int
+            Number of top documents to retrieve for each query
+        backend : str
+            Backend to use (ignored, uses GPU)
+        sorted : bool
+            Whether to sort the results by score
+        weight_mask : np.ndarray, optional
+            Weight mask to apply to document scores
+            
+        Returns
+        -------
+        tuple
+            (batch_scores, batch_indices) where each is np.ndarray of shape (batch_size, k)
+        """
+        if not query_tokens_batched:
+            return np.array([]), np.array([])
+        start = time.time()
+        lengths = []
+        for i in range(len(query_tokens_batched)):
+            lengths.append(len(query_tokens_batched[i]))
+        
+        batch_size = len(query_tokens_batched)
+        num_docs = self.scores["num_docs"]
+        k = min(k, num_docs)  # Ensure k doesn't exceed number of documents
+        
+        # Handle empty queries
+        if all(len(query) == 0 for query in query_tokens_batched):
+            # All queries are empty, return zero scores
+            batch_scores = np.zeros((batch_size, k), dtype=np.float32)
+            batch_indices = np.zeros((batch_size, k), dtype=np.int32)
+            return batch_scores, batch_indices
+        print(f"time taken construct queries: {time.time() - start}")        
+        start = time.time()
+        # Get scores for all queries using batched GPU method
+        scores_tensor = self._get_scores_batched(query_tokens_batched, weight_mask)
+        print(f"time taken scores: {time.time() - start}")        
+        start = time.time()
+        # Get top-k for all queries simultaneously
+        if sorted:
+            # Get top-k with sorting (descending order)
+            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=1, sorted=True, largest=True)
+        else:
+            # Get top-k without sorting (faster)
+            topk_scores, topk_indices = torch.topk(scores_tensor, k, dim=1, sorted=False, largest=True)
+        print(f"time taken topk: {time.time() - start}")        
+        # Convert back to numpy
+        batch_scores = topk_scores.cpu().numpy()
+        batch_indices = topk_indices.cpu().numpy()
+        
+        return batch_scores, batch_indices
 
     def _get_top_k_results(
         self,
@@ -778,8 +1268,8 @@ class BM25:
                 raise ValueError(
                     "The length of the weight_mask must be the same as the length of the corpus."
                 )
-
         if self.backend == "numba":
+            start = time.time()
             if _retrieve_numba_functional is None:
                 raise ImportError(
                     "Numba is not installed. Please install numba wiith `pip install numba` to use the numba backend."
@@ -815,11 +1305,45 @@ class BM25:
                 nonoccurrence_array=self.nonoccurrence_array,
                 weight_mask=weight_mask,
             )
-
+            print(f"time taken numba: {time.time() - start}")        
             if return_as == "tuple":
                 return Results(documents=res[0], scores=res[1])
             else:
                 return res
+        if self.device.type == "cuda":
+            # Use batched GPU processing for better performance
+            batch_scores, batch_indices = self._get_top_k_results_batched(
+                query_tokens_batched=query_tokens,
+                k=k,
+                backend=backend_selection,
+                sorted=sorted,
+                weight_mask=weight_mask,
+            )
+            
+            start = time.time()
+            # Post-process results to match expected format
+            corpus = corpus if corpus is not None else self.corpus
+            
+            if corpus is None:
+                retrieved_docs = batch_indices
+            else:
+                # Handle corpus indexing for batched results
+                if isinstance(corpus, utils.corpus.JsonlCorpus):
+                    retrieved_docs = corpus[batch_indices]
+                elif isinstance(corpus, np.ndarray) and corpus.ndim == 1:
+                    retrieved_docs = corpus[batch_indices]
+                else:
+                    # For regular lists, we need to flatten indices and reshape
+                    flat_indices = batch_indices.flatten()
+                    flat_docs = [corpus[i] for i in flat_indices]
+                    retrieved_docs = np.array(flat_docs).reshape(batch_indices.shape)
+            print(f"time taken post process: {time.time() - start}")        
+            if return_as == "tuple":
+                return Results(documents=retrieved_docs, scores=batch_scores)
+            elif return_as == "documents":
+                return retrieved_docs
+            else:
+                raise ValueError("`return_as` must be either 'tuple' or 'documents'")
 
         tqdm_kwargs = {
             "total": len(query_tokens),
@@ -827,6 +1351,7 @@ class BM25:
             "leave": leave_progress,
             "disable": not show_progress,
         }
+        start = time.time()
         topk_fn = partial(
             self._get_top_k_results,
             k=k,
@@ -834,7 +1359,6 @@ class BM25:
             backend=backend_selection,
             weight_mask=weight_mask,
         )
-
         if n_threads == 0:
             # Use a simple map function to retrieve the results
             out = tqdm(map(topk_fn, query_tokens), **tqdm_kwargs)
@@ -850,6 +1374,7 @@ class BM25:
 
         scores, indices = zip(*out)
         scores, indices = np.array(scores), np.array(indices)
+        print(f"time taken topk_fn: {time.time() - start}")        
 
         corpus = corpus if corpus is not None else self.corpus
 
@@ -1066,6 +1591,7 @@ class BM25:
         mmap=False,
         allow_pickle=False,
         load_vocab=True,
+        device="cpu",
     ):
         """
         Load a BM25S index that was saved using the `save` method.
@@ -1136,7 +1662,7 @@ class BM25:
         original_version = params.pop("version", None)
         num_docs = params.pop("num_docs", None)
 
-        bm25_obj = cls(**params)
+        bm25_obj = cls(**params, device=device)
         bm25_obj.vocab_dict = vocab_dict
         bm25_obj._original_version = original_version
         bm25_obj.unique_token_ids_set = set(bm25_obj.vocab_dict.values())
@@ -1150,6 +1676,21 @@ class BM25:
             num_docs=num_docs,
             allow_pickle=allow_pickle,
         )
+        
+        # Convert scores to GPU tensors if device is CUDA
+        if bm25_obj.device.type == "cuda":
+            # Check if method requires nonoccurrence arrays (not supported for GPU yet)
+            if bm25_obj.method in bm25_obj.methods_requiring_nonoccurrence:
+                raise ValueError(
+                    f"GPU acceleration is not supported for method '{bm25_obj.method}' which requires "
+                    f"nonoccurrence arrays. Please use one of: 'robertson', 'lucene', 'atire' "
+                    f"or set device='cpu' to use {bm25_obj.method}."
+                )
+            
+            # Convert CPU scores to GPU tensors
+            cpu_scores = bm25_obj.scores
+            bm25_obj.scores = bm25_obj._convert_scores_to_torch_csc(cpu_scores)
+            logger.debug(f"Converted loaded scores to GPU tensors for device: {bm25_obj.device}")
 
         if load_corpus:
             # load the model from the snapshot
@@ -1181,6 +1722,94 @@ class BM25:
             bm25_obj.nonoccurrence_array = None
 
         return bm25_obj
+
+    def free_gpu_memory(self):
+        """
+        Free GPU memory by moving tensors to CPU and clearing GPU cache.
+        
+        This method is useful for managing GPU memory when you're done with 
+        GPU-accelerated operations or need to free up memory for other tasks.
+        After calling this method, the BM25 object will use CPU computation.
+        
+        Note
+        ----
+        After calling this method, you can call `to_gpu()` to move tensors 
+        back to GPU if needed.
+        """
+        if self.device.type == "cuda" and hasattr(self, 'scores') and isinstance(self.scores, dict):
+            # Check if scores are already GPU tensors
+            if "sparse_tensor" in self.scores:
+                logger.debug("Converting GPU tensors back to CPU arrays")
+                
+                # Convert GPU tensors back to CPU numpy arrays
+                cpu_scores = {
+                    "data": self.scores["data"].cpu().numpy(),
+                    "indices": self.scores["indices"].cpu().numpy(), 
+                    "indptr": self.scores["indptr"].cpu().numpy(),
+                    "num_docs": self.scores["num_docs"]
+                }
+                
+                # Replace GPU tensors with CPU arrays
+                self.scores = cpu_scores
+                
+                # Update device to CPU
+                self.device = torch.device("cpu")
+                
+                # Clear GPU cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                logger.debug("GPU memory freed and device switched to CPU")
+            else:
+                logger.debug("Scores are already on CPU, only clearing GPU cache")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        else:
+            logger.debug("BM25 object is already using CPU device")
+
+    def to_gpu(self, device="cuda"):
+        """
+        Move BM25 tensors to GPU for accelerated computation.
+        
+        This method converts CPU-based scores to GPU tensors. Useful when 
+        you want to switch from CPU to GPU computation or after calling 
+        `free_gpu_memory()`.
+        
+        Parameters
+        ----------
+        device : str
+            The GPU device to use (default: "cuda")
+            
+        Raises
+        ------
+        ValueError
+            If the BM25 method is not supported on GPU
+        RuntimeError
+            If CUDA is not available
+        """
+        if device != "cpu" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+            
+        if device == "cuda" and self.method in self.methods_requiring_nonoccurrence:
+            raise ValueError(
+                f"GPU acceleration is not supported for method '{self.method}' which requires "
+                f"nonoccurrence arrays. Please use one of: 'robertson', 'lucene', 'atire'."
+            )
+        
+        # Update device
+        old_device = self.device
+        self.device = torch.device(device)
+        
+        if device == "cuda" and hasattr(self, 'scores'):
+            # Convert to GPU tensors if not already
+            if not isinstance(self.scores, dict) or "sparse_tensor" not in self.scores:
+                logger.debug(f"Converting scores from {old_device} to {self.device}")
+                self.scores = self._convert_scores_to_torch_csc(self.scores)
+                logger.debug("Successfully moved BM25 tensors to GPU")
+            else:
+                logger.debug("Scores are already GPU tensors")
+        else:
+            logger.debug(f"Device switched to {self.device}")
 
     def activate_numba_scorer(self):
         """

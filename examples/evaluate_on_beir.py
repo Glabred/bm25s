@@ -78,13 +78,19 @@ def run_benchmark(dataset, save_dir="datasets"):
         queries_lst, stemmer=stemmer, leave=False
     )
 
-    model = bm25s.BM25(method="lucene", k1=1.2, b=0.75)
+    model = bm25s.BM25(method="lucene", k1=1.2, b=0.75, device="cuda")
+    timer = bm25s.utils.benchmark.Timer("[BM25S]")
+    t = timer.start("Indexing")
     model.index(corpus_tokens, leave_progress=False)
-    
+    timer.stop(t, show=True, n_total=len(corpus_tokens))
     ############## BENCHMARKING BEIR HERE ##############
+    t = timer.start("Retrieving")
     queried_results, queried_scores = model.retrieve(
         query_tokens, corpus=corpus_ids, k=1000, n_threads=4
     )
+    timer.stop(t, show=True, n_total=len(query_tokens))
+    mem_use = bm25s.utils.benchmark.get_max_memory_usage()
+    print(f"Memory usage after loading the index: {mem_use:.2f} GB")
 
     results_dict = postprocess_results_for_eval(queried_results, queried_scores, qids)
     ndcg, _map, recall, precision = EvaluateRetrieval.evaluate(
